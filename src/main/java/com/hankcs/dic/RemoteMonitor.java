@@ -1,10 +1,8 @@
 package com.hankcs.dic;
 
-import com.hankcs.hanlp.HanLP;
 import com.hankcs.hanlp.corpus.io.IOUtil;
 import com.hankcs.hanlp.corpus.tag.Nature;
 import com.hankcs.hanlp.dictionary.CustomDictionary;
-import com.hankcs.hanlp.dictionary.other.CharTable;
 import com.hankcs.hanlp.dictionary.stopword.CoreStopWordDictionary;
 import com.hankcs.hanlp.utility.LexiconUtility;
 import com.hankcs.help.ESPluginLoggerFactory;
@@ -27,6 +25,7 @@ import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
+import java.util.Arrays;
 
 /**
  * @project: elasticsearch-analysis-hanlp
@@ -173,21 +172,19 @@ public class RemoteMonitor implements Runnable {
                         firstLine = false;
                     }
 
-                    // 切分
-                    String[] param = line.split(SPLITTER);
-                    String word = param[0];
-
-                    // 排除空行
-                    if (word.length() == 0) {
-                        continue;
+                    final ParsedUpdateCmd parsedUpdateCmd = parseUpdateCmdLine(line);
+                    if (parsedUpdateCmd.isAdd()) {
+                        CustomDictionary.insert(
+                            parsedUpdateCmd.getWord(),
+                            analysisNatureWithFrequency(defaultInfo.v2(), parsedUpdateCmd.getNatureAndFrequents())
+                        );
+                    } else if (parsedUpdateCmd.isDelete()) {
+                        CustomDictionary.remove(parsedUpdateCmd.getWord());
+                    } else if (parsedUpdateCmd.isSkip()) {
+                        // skip, do nothing
+                    } else {
+                        logger.error(String.format("unknown updateCmd = %s", line));
                     }
-
-                    // 正规化
-                    if (HanLP.Config.Normalization) {
-                        word = CharTable.convert(word);
-                    }
-                    logger.debug("hanlp remote custom word: {}", word);
-                    CustomDictionary.insert(word, analysisNatureWithFrequency(defaultInfo.v2(), param));
                 }
                 in.close();
                 response.close();
@@ -202,6 +199,45 @@ public class RemoteMonitor implements Runnable {
             } catch (Exception e) {
                 e.printStackTrace();
             }
+        }
+    }
+
+    /**
+     * 将一条词更新命令行解析成 Java Object。
+     * 本方法兼容旧版命令行的解析，旧版命令行是没有指定更新操作，默认是add。
+     * @param line 命令行, 形如: 某词 [add|delete] 词性A A的频次 词性B B的频次
+     */
+    private ParsedUpdateCmd parseUpdateCmdLine(String line) {
+        String word;
+        String updateAction;
+        String[] natureAndFreqs;
+
+        // 切分
+        String[] param = line.split(SPLITTER);
+        word = param[0];
+
+        // 排除空行
+        if (word.length() == 0) {
+            return new ParsedUpdateCmd(word, ParsedUpdateCmd.UPDATE_ACTION_SKIP, new String[0]);
+        } else {
+
+            if (param.length >= 2) {
+                if (param[1].equals(ParsedUpdateCmd.UPDATE_ACTION_ADD) || param[1].equals(ParsedUpdateCmd.UPDATE_ACTION_DELETE)) {
+                    updateAction = param[1];
+                    if (param.length >= 3) {
+                        natureAndFreqs = Arrays.copyOfRange(param, 2, param.length);
+                    } else {
+                        natureAndFreqs = new String[0];
+                    }
+                } else {
+                    updateAction = ParsedUpdateCmd.UPDATE_ACTION_ADD;
+                    natureAndFreqs = Arrays.copyOfRange(param, 1, param.length);
+                }
+            } else {
+                updateAction = ParsedUpdateCmd.UPDATE_ACTION_ADD;
+                natureAndFreqs = new String[0];
+            }
+            return new ParsedUpdateCmd(word, updateAction, natureAndFreqs);
         }
     }
 
@@ -228,7 +264,17 @@ public class RemoteMonitor implements Runnable {
                         firstLine = false;
                     }
                     logger.debug("hanlp remote stop word: {}", line);
-                    CoreStopWordDictionary.add(line);
+                    ParsedUpdateCmd updateCmd = parseUpdateCmdLine(line);
+
+                    if(updateCmd.isSkip()){
+                        // skip, do nothing
+                    } else if(updateCmd.isAdd()) {
+                        CoreStopWordDictionary.add(updateCmd.getWord());
+                    } else if(updateCmd.isDelete()){
+                        CoreStopWordDictionary.remove(updateCmd.getWord());
+                    } else {
+                        logger.error("unknown update cmd = %s", line);
+                    }
                 }
                 in.close();
                 response.close();
@@ -293,18 +339,18 @@ public class RemoteMonitor implements Runnable {
      * 分析词性和频次
      *
      * @param defaultNature 默认词性
-     * @param param         行数据
-     * @return 返回[单词] [词性A] [A的频次] [词性B] [B的频次] ...
+     * @param natureWithFreq  由词性、词频作为元素构成的数组。形如[词性A] [A的频次] [词性B] [B的频次]
+     * @return 返回字符串，形如[词性A] [A的频次] [词性B] [B的频次] ...
      */
-    private String analysisNatureWithFrequency(Nature defaultNature, String[] param) {
-        int natureCount = (param.length - 1) / 2;
+    private String analysisNatureWithFrequency(Nature defaultNature, String[] natureWithFreq) {
+        int natureCount = natureWithFreq.length / 2;
         StringBuilder builder = new StringBuilder();
         if (natureCount == 0) {
             builder.append(defaultNature).append(" ").append(1000);
         } else {
             for (int i = 0; i < natureCount; ++i) {
-                Nature nature = LexiconUtility.convertStringToNature(param[1 + 2 * i]);
-                int frequency = Integer.parseInt(param[2 + 2 * i]);
+                Nature nature = LexiconUtility.convertStringToNature(natureWithFreq[2 * i]);
+                int frequency = Integer.parseInt(natureWithFreq[1 + 2 * i]);
                 builder.append(nature).append(" ").append(frequency);
                 if (i != natureCount - 1) {
                     builder.append(" ");
@@ -312,5 +358,54 @@ public class RemoteMonitor implements Runnable {
             }
         }
         return builder.toString();
+    }
+
+    private class ParsedUpdateCmd {
+        public static final String UPDATE_ACTION_SKIP = "skip";
+        public static final String UPDATE_ACTION_ADD = "add";
+        public static final String UPDATE_ACTION_DELETE = "delete";
+
+        private String word;
+        private String updateAction;
+        private String[] natureAndFrequents;
+
+        public ParsedUpdateCmd(String word, String updateAction, String[] natureAndFrequents) {
+            this.word = word;
+            this.updateAction = updateAction;
+            this.natureAndFrequents = natureAndFrequents;
+        }
+
+        public String getWord() {
+            return word;
+        }
+
+        public String getUpdateAction() {
+            return updateAction;
+        }
+
+        public String[] getNatureAndFrequents() {
+            return natureAndFrequents;
+        }
+
+        public boolean isSkip(){
+            return updateAction.equals(UPDATE_ACTION_SKIP);
+        }
+
+        public boolean isAdd(){
+            return updateAction.equals(UPDATE_ACTION_ADD);
+        }
+
+        public boolean isDelete(){
+            return updateAction.equals(UPDATE_ACTION_DELETE);
+        }
+
+        @Override
+        public String toString() {
+            return "ParsedUpdateCmd{" +
+                "word='" + word + '\'' +
+                ", updateAction='" + updateAction + '\'' +
+                ", natureAndFrequents=" + Arrays.toString(natureAndFrequents) +
+                '}';
+        }
     }
 }
