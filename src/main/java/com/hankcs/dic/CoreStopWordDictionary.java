@@ -39,7 +39,7 @@ public class CoreStopWordDictionary {
     public CoreStopWordDictionary() {
     }
 
-    private static boolean contains(String key) {
+    public static boolean contains(String key) {
         return dictionary.contains(key);
     }
 

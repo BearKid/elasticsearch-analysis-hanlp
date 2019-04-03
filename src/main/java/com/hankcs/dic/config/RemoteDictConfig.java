@@ -32,6 +32,11 @@ public class RemoteDictConfig {
 
     private static final String REMOTE_EXT_STOP = "remote_ext_stopwords";
 
+    /**
+     * 向指定HTTP地址上报某次拉取远程词典的更新任务的结果
+     */
+    private static final String REMOTE_EXT_REPORT_FETCH_STATUS = "remote_ext_report_fetch_status";
+
     private Properties props;
 
     private String configFile;
@@ -81,6 +86,10 @@ public class RemoteDictConfig {
 
     public List<String> getRemoteExtStopWordDictionarys() {
         return getRemoteExtFiles(REMOTE_EXT_STOP);
+    }
+
+    public String getReportFetchStatusURL(){
+        return getProperty(REMOTE_EXT_REPORT_FETCH_STATUS);
     }
 
     private List<String> getRemoteExtFiles(String key) {

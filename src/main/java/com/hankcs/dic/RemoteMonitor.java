@@ -1,31 +1,45 @@
 package com.hankcs.dic;
 
+import com.google.gson.Gson;
 import com.hankcs.hanlp.corpus.io.IOUtil;
 import com.hankcs.hanlp.corpus.tag.Nature;
 import com.hankcs.hanlp.dictionary.CustomDictionary;
-import com.hankcs.hanlp.dictionary.stopword.CoreStopWordDictionary;
 import com.hankcs.hanlp.utility.LexiconUtility;
-import com.hankcs.help.ESPluginLoggerFactory;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.apache.http.Header;
+import org.apache.http.HttpHeaders;
+import org.apache.http.HttpResponse;
 import org.apache.http.HttpStatus;
+import org.apache.http.client.HttpResponseException;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpHead;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.utils.DateUtils;
+import org.apache.http.entity.ContentType;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.BasicResponseHandler;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
-import org.apache.logging.log4j.Logger;
+import org.apache.http.util.EntityUtils;
 import org.elasticsearch.SpecialPermission;
 import org.elasticsearch.common.collect.Tuple;
-import org.elasticsearch.core.internal.io.IOUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.UnsupportedEncodingException;
+import java.net.InetAddress;
+import java.net.URLEncoder;
+import java.net.UnknownHostException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
-import java.util.Arrays;
+import java.util.*;
 
 /**
  * @project: elasticsearch-analysis-hanlp
@@ -35,7 +49,8 @@ import java.util.Arrays;
  */
 public class RemoteMonitor implements Runnable {
 
-    private static final Logger logger = ESPluginLoggerFactory.getLogger(RemoteMonitor.class.getName());
+//    private static final Logger logger = ESPluginLoggerFactory.getLogger(RemoteMonitor.class.getName());
+    private static final Logger logger = LoggerFactory.getLogger(RemoteMonitor.class);
 
     private static CloseableHttpClient httpclient = HttpClients.createDefault();
     /**
@@ -50,16 +65,23 @@ public class RemoteMonitor implements Runnable {
      * 请求地址
      */
     private String location;
+
+    /**
+     * 用于上报“拉取更新词典情况”的HTTP URL
+     */
+    private String reportFetchStatusURL;
+
     /**
      * 数据类型
      */
-    private String type;
+    private DicCategory dicCategory;
 
     private static final String SPLITTER = "\\s";
 
-    public RemoteMonitor(String location, String type) {
+    public RemoteMonitor(String location, DicCategory dicCategory, String reportFetchStatusURL) {
         this.location = location;
-        this.type = type;
+        this.reportFetchStatusURL = reportFetchStatusURL;
+        this.dicCategory = dicCategory;
         this.last_modified = null;
         this.eTags = null;
     }
@@ -90,29 +112,32 @@ public class RemoteMonitor implements Runnable {
 
         // 设置请求头
         if (last_modified != null) {
-            head.setHeader("If-Modified-Since", last_modified);
+            head.setHeader(HttpHeaders.IF_MODIFIED_SINCE, last_modified);
         }
         if (eTags != null) {
-            head.setHeader("If-None-Match", eTags);
+            head.setHeader(HttpHeaders.IF_NONE_MATCH, eTags);
         }
 
         CloseableHttpResponse response = null;
         try {
             response = httpclient.execute(head);
             if (response.getStatusLine().getStatusCode() == HttpStatus.SC_OK) {
-                if ((response.getLastHeader("Last-Modified") != null) && !response.getLastHeader("Last-Modified").getValue().equalsIgnoreCase(last_modified)) {
-                    loadRemoteCustomWords(response);
-                } else if ((response.getLastHeader("ETag") != null) && !response.getLastHeader("ETag").getValue().equalsIgnoreCase(eTags)) {
-                    loadRemoteCustomWords(response);
+                if (response.getLastHeader(HttpHeaders.LAST_MODIFIED) != null
+                    && !response.getLastHeader(HttpHeaders.LAST_MODIFIED).getValue().equalsIgnoreCase(last_modified)
+                ) {
+                    loadRemoteCustomWords();
+                } else if (response.getLastHeader(HttpHeaders.ETAG) != null
+                    && !response.getLastHeader(HttpHeaders.ETAG).getValue().equalsIgnoreCase(eTags)
+                ) {
+                    loadRemoteCustomWords();
                 }
             } else if (response.getStatusLine().getStatusCode() == HttpStatus.SC_NOT_MODIFIED) {
-                logger.info("remote_ext_dict {} is without modified", location);
+                logger.info("remote_ext_dict {} is without modified since {}", location, last_modified);
             } else {
                 logger.info("remote_ext_dict {} return bad code {}", location, response.getStatusLine().getStatusCode());
             }
         } catch (Exception e) {
-            e.printStackTrace();
-            logger.error("remote_ext_dict {} error!", e, location);
+            logger.error("remote_ext_dict {} error!", location, e);
         } finally {
             try {
                 if (response != null) {
@@ -126,80 +151,224 @@ public class RemoteMonitor implements Runnable {
 
     /**
      * 加载远程自定义词典
-     *
-     * @param response header响应
      */
-    private void loadRemoteCustomWords(CloseableHttpResponse response) {
-        switch (type) {
-            case "custom":
-                logger.info("load hanlp remote custom dict path: {}", location);
-                loadRemoteWordsUnprivileged(location);
-                logger.info("finish load hanlp remote custom dict path: {}", location);
-                break;
-            case "stop":
-                logger.info("load hanlp remote stop words path: {}", location);
-                loadRemoteStopWordsUnprivileged(location);
-                logger.info("finish load hanlp remote stop words path: {}", location);
-                break;
-            default:
-                return;
+    private void loadRemoteCustomWords() {
+
+        logger.info("load hanlp remote {} dict path: {}", dicCategory, location);
+        final Tuple<String, Nature> pathInfo = analyzePath(dicCategory, location);
+        final Date lastModifiedOfPreviousFetch = getLastModifiedOfPreviousFetch();
+        final DicFetchStatus dicFetchStatus = loadRemoteWordsUnprivileged(
+            dicCategory, pathInfo.v1(), lastModifiedOfPreviousFetch, pathInfo.v2()
+        );
+        logger.info("finish load hanlp remote {} dict path: {}", dicCategory.getType(), location);
+
+        if(dicFetchStatus.getLastModified() != null) {
+            last_modified = DateUtils.formatDate(dicFetchStatus.getLastModified());
         }
-        last_modified = response.getLastHeader("Last-Modified") == null ? null : response.getLastHeader("Last-Modified").getValue();
-        eTags = response.getLastHeader("ETag") == null ? null : response.getLastHeader("ETag").getValue();
+
+        if(dicFetchStatus.getETag() != null) {
+            eTags = dicFetchStatus.getETag();
+        }
+
+        reportToMaster(dicCategory, dicFetchStatus);
+    }
+
+    /**
+     * 上报某次远程词典拉取任务的结果
+     *
+     * @param dicCategory
+     * @param dicFetchStatus 拉取词典任务的结果
+     */
+    private void reportToMaster(DicCategory dicCategory, DicFetchStatus dicFetchStatus) {
+        if(reportFetchStatusURL != null) {
+            final CloseableHttpClient httpClient = HttpClients.createDefault();
+            try {
+                HttpPost post = new HttpPost(reportFetchStatusURL);
+                Map<String, Object> bodyJson = new HashMap<>(4);
+                String ip = null;
+                try {
+                    ip = InetAddress.getLocalHost().getHostAddress();
+                } catch (UnknownHostException e) {
+                    logger.error(e.getMessage(), e);
+                }
+                bodyJson.put("ip", ip);
+                bodyJson.put("dicCategory", dicCategory.getCode());
+                bodyJson.put("fetchStart", dicFetchStatus.getFetchStart().getTime());
+                bodyJson.put("fetchEnd", dicFetchStatus.getFetchEnd().getTime());
+                if(dicFetchStatus.getLastModifiedOfPreviousFetch() != null) {
+                    bodyJson.put("lastModifiedOfPreviousFetch", dicFetchStatus.getLastModifiedOfPreviousFetch().getTime());
+                }
+                if(dicFetchStatus.getLastModified() != null) {
+                    bodyJson.put("lastModified", dicFetchStatus.getLastModified().getTime());
+                }
+                bodyJson.put("successNum", dicFetchStatus.getSuccessNum());
+                bodyJson.put("failNum", dicFetchStatus.getFailNum());
+                if (dicFetchStatus.getSampleException() != null) {
+                    bodyJson.put("sampleExceptionClass", dicFetchStatus.getSampleException().getClass().getName());
+                    bodyJson.put("sampleExceptionStack", ExceptionUtils.getStackTrace(dicFetchStatus.getSampleException()));
+                }
+                post.setEntity(new StringEntity(new Gson().toJson(bodyJson), ContentType.APPLICATION_JSON));
+                try {
+                    httpClient.execute(post, new BasicResponseHandler());
+                } catch (HttpResponseException e) {
+                    logger.error("上报拉取远程词典的日志。statusCode = {}", e.getStatusCode(), e);
+                } catch (IOException e){
+                    logger.error("上报拉取远程词典的日志", e);
+                }
+            } finally {
+                try {
+                    httpClient.close();
+                } catch (IOException e) {
+                    logger.error("url = " + reportFetchStatusURL, e);
+                }
+            }
+        }
+    }
+
+    /**
+     * 获取最近一次拉取远程词典时所返回的词典最后修改时间点
+     */
+    private Date getLastModifiedOfPreviousFetch() {
+        if (last_modified == null) {
+            return null;
+        } else {
+            return DateUtils.parseDate(last_modified);
+        }
     }
 
     /**
      * 从远程服务器上下载自定义词条
      *
-     * @param location 配置条目
+     * @param dicType 词典类型。停用词词典(stop)或主词典
+     * @param httpURL http请求地址
+     * @param lastModifiedOfPreviousFetch 最近一次成功拉取远程词典时返回的词典最后修改时间点。
+     *                                    告知远程服务器该时间点，服务器应尽量返回自该时间点以后有变动过的词条，而非全量返回。
+     *                                    如果为null，则全量返回。
+     * @param defaultNature 默认词性。当远程返回的词条不含有词性信息时采用。
      */
-    private void loadRemoteWordsUnprivileged(String location) {
-        Tuple<String, Nature> defaultInfo = analysisDefaultInfo(location);
-        CloseableHttpClient httpclient = HttpClients.createDefault();
-        CloseableHttpResponse response = null;
-        BufferedReader in = null;
-        HttpGet get = new HttpGet(defaultInfo.v1());
-        get.setConfig(buildRequestConfig());
+    private DicFetchStatus loadRemoteWordsUnprivileged(DicCategory dicType, String httpURL, Date lastModifiedOfPreviousFetch, Nature defaultNature) {
+        final DicFetchStatus dicFetchStatus = new DicFetchStatus();
+        dicFetchStatus.start();
+        dicFetchStatus.setLastModifiedOfPreviousFetch(lastModifiedOfPreviousFetch);
+        CloseableHttpClient httpclient = null;
         try {
-            response = httpclient.execute(get);
-            if (response.getStatusLine().getStatusCode() == HttpStatus.SC_OK) {
-                in = new BufferedReader(new InputStreamReader(response.getEntity().getContent(), analysisDefaultCharset(response)));
-                String line;
-                boolean firstLine = true;
-                while ((line = in.readLine()) != null) {
-                    if (firstLine) {
-                        line = IOUtil.removeUTF8BOM(line);
-                        firstLine = false;
+            httpclient = HttpClients.createDefault();
+            HttpGet get = buildHttpGetOfFetchingDic(httpURL, lastModifiedOfPreviousFetch);
+
+            httpclient.execute(get, response -> {
+                if (response.getStatusLine().getStatusCode() == HttpStatus.SC_OK) {
+                    Header lastModifiedHeader = response.getLastHeader(HttpHeaders.LAST_MODIFIED);
+                    if(lastModifiedHeader != null) dicFetchStatus.setLastModified(DateUtils.parseDate(lastModifiedHeader.getValue()));
+
+                    Header ETagHeader = response.getLastHeader(HttpHeaders.ETAG);
+                    if(ETagHeader != null) dicFetchStatus.setETag(ETagHeader.getValue());
+
+                    BufferedReader in = new BufferedReader(new InputStreamReader(
+                        response.getEntity().getContent(), analysisDefaultCharset(response))
+                    );
+                    String line;
+                    boolean firstLine = true;
+                    while ((line = in.readLine()) != null) {
+                        try {
+                            if (firstLine) {
+                                line = IOUtil.removeUTF8BOM(line);
+                                firstLine = false;
+                            }
+
+                            final ParsedUpdateCmd updateCmd = parseUpdateCmdLine(line);
+
+                            if(dicType.equals(DicCategory.MAIN)) {
+                                if (updateCmd.isAdd()) {
+                                    CustomDictionary.insert(
+                                        updateCmd.getWord(),
+                                        analysisNatureWithFrequency(defaultNature, updateCmd.getNatureAndFrequents())
+                                    );
+                                    dicFetchStatus.incrSuccessNum();
+                                } else if (updateCmd.isDelete()) {
+                                    CustomDictionary.remove(updateCmd.getWord());
+                                    dicFetchStatus.incrSuccessNum();
+                                } else if (updateCmd.isSkip()) {
+                                    // skip, do nothing
+                                } else {
+                                    String msg = String.format("unknown updateCmd = %s", line);
+                                    dicFetchStatus.setSampleException(new IllegalArgumentException(msg));
+                                    dicFetchStatus.incrFailNum();
+                                    logger.error(msg);
+                                }
+                            } else if(dicType.equals(DicCategory.STOP_WORD)){
+                                if(updateCmd.isSkip()){
+                                    // skip, do nothing
+                                } else if(updateCmd.isAdd()) {
+                                    if(!CoreStopWordDictionary.contains(updateCmd.getWord())){
+                                        CoreStopWordDictionary.add(updateCmd.getWord());
+                                    }
+                                    dicFetchStatus.incrSuccessNum();
+                                } else if(updateCmd.isDelete()){
+                                    if(CoreStopWordDictionary.contains(updateCmd.getWord())) {
+                                        CoreStopWordDictionary.remove(updateCmd.getWord());
+                                    }
+                                    dicFetchStatus.incrSuccessNum();
+                                } else {
+                                    final String msg = String.format("unknown update cmd = %s", line);
+                                    dicFetchStatus.setSampleException(new IllegalArgumentException(msg));
+                                    dicFetchStatus.incrFailNum();
+                                    logger.error(msg);
+                                }
+                            }
+                        } catch (Exception e) {
+                            dicFetchStatus.incrFailNum();
+                            dicFetchStatus.setSampleException(e);
+                            if (dicFetchStatus.getFailNum() < 3) logger.error(String.format("line = %s", line), e);
+                        }
                     }
 
-                    final ParsedUpdateCmd parsedUpdateCmd = parseUpdateCmdLine(line);
-                    if (parsedUpdateCmd.isAdd()) {
-                        CustomDictionary.insert(
-                            parsedUpdateCmd.getWord(),
-                            analysisNatureWithFrequency(defaultInfo.v2(), parsedUpdateCmd.getNatureAndFrequents())
-                        );
-                    } else if (parsedUpdateCmd.isDelete()) {
-                        CustomDictionary.remove(parsedUpdateCmd.getWord());
-                    } else if (parsedUpdateCmd.isSkip()) {
-                        // skip, do nothing
-                    } else {
-                        logger.error(String.format("unknown updateCmd = %s", line));
-                    }
+                } else {
+                    dicFetchStatus.setSampleException(
+                        new HttpResponseException(
+                            response.getStatusLine().getStatusCode(),
+                            EntityUtils.toString(response.getEntity(), "utf-8")
+                        )
+                    );
                 }
-                in.close();
-                response.close();
-            }
-            response.close();
-        } catch (IllegalStateException | IOException e) {
-            logger.error("get remote words {} error", e, location);
+                return true;
+            });
+
+        } catch (Exception e) {
+            dicFetchStatus.setSampleException(e);
+            Integer statusCode = (e instanceof HttpResponseException) ? ((HttpResponseException)e).getStatusCode() : null;
+            logger.error("get remote words {} error, statusCode = {}", httpURL, statusCode, e);
         } finally {
             try {
-                IOUtils.close(in);
-                IOUtils.close(response);
-            } catch (Exception e) {
-                e.printStackTrace();
+                if(httpclient != null) httpclient.close();
+            } catch (IOException e) {
+                logger.error(String.format("fail to close http client, location = %s", httpURL), e);
+            }
+            dicFetchStatus.end();
+        }
+        return dicFetchStatus;
+    }
+
+    /**
+     * 构建用于远程拉取词典的Http Get
+     * @param httpURL 远程拉取词典的http地址
+     * @param lastModifiedOfPreviousFetch http请求的一个参数，告知上次拉取成功时词典返回的最后修改时间点
+     */
+    private HttpGet buildHttpGetOfFetchingDic(String httpURL, Date lastModifiedOfPreviousFetch){
+        StringBuilder getUrlBuilder = new StringBuilder();
+        getUrlBuilder.append(httpURL);
+        if(lastModifiedOfPreviousFetch != null){
+            if(!httpURL.contains("?")) getUrlBuilder.append("?");
+            getUrlBuilder.append("&lastModifiedOfPreviousFetch=");
+            final String lastFetchStr = DateUtils.formatDate(lastModifiedOfPreviousFetch);
+            try {
+                getUrlBuilder.append(URLEncoder.encode(lastFetchStr, "utf-8"));
+            } catch (UnsupportedEncodingException e) {
+                throw new RuntimeException("encode string = " + lastFetchStr, e);
             }
         }
+        HttpGet get = new HttpGet(getUrlBuilder.toString());
+        get.setConfig(buildRequestConfig());
+        return get;
     }
 
     /**
@@ -241,57 +410,6 @@ public class RemoteMonitor implements Runnable {
         }
     }
 
-    /**
-     * 从远程服务器上下载停止词词条
-     *
-     * @param location 配置条目
-     */
-    private void loadRemoteStopWordsUnprivileged(String location) {
-        CloseableHttpClient httpclient = HttpClients.createDefault();
-        CloseableHttpResponse response = null;
-        BufferedReader in = null;
-        HttpGet get = new HttpGet(location);
-        get.setConfig(buildRequestConfig());
-        try {
-            response = httpclient.execute(get);
-            if (response.getStatusLine().getStatusCode() == HttpStatus.SC_OK) {
-                in = new BufferedReader(new InputStreamReader(response.getEntity().getContent(), analysisDefaultCharset(response)));
-                String line;
-                boolean firstLine = true;
-                while ((line = in.readLine()) != null) {
-                    if (firstLine) {
-                        line = IOUtil.removeUTF8BOM(line);
-                        firstLine = false;
-                    }
-                    logger.debug("hanlp remote stop word: {}", line);
-                    ParsedUpdateCmd updateCmd = parseUpdateCmdLine(line);
-
-                    if(updateCmd.isSkip()){
-                        // skip, do nothing
-                    } else if(updateCmd.isAdd()) {
-                        CoreStopWordDictionary.add(updateCmd.getWord());
-                    } else if(updateCmd.isDelete()){
-                        CoreStopWordDictionary.remove(updateCmd.getWord());
-                    } else {
-                        logger.error("unknown update cmd = %s", line);
-                    }
-                }
-                in.close();
-                response.close();
-            }
-            response.close();
-        } catch (IllegalStateException | IOException e) {
-            logger.error("get remote words {} error", e, location);
-        } finally {
-            try {
-                IOUtils.close(in);
-                IOUtils.close(response);
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
     private RequestConfig buildRequestConfig() {
         return RequestConfig.custom()
                 .setConnectionRequestTimeout(10 * 1000)
@@ -306,7 +424,7 @@ public class RemoteMonitor implements Runnable {
      * @param response 响应
      * @return 返回编码
      */
-    private Charset analysisDefaultCharset(CloseableHttpResponse response) {
+    private Charset analysisDefaultCharset(HttpResponse response) {
         Charset charset = StandardCharsets.UTF_8;
         // 获取编码，默认为utf-8
         if (response.getEntity().getContentType().getValue().contains("charset=")) {
@@ -319,20 +437,25 @@ public class RemoteMonitor implements Runnable {
     /**
      * 解析默认信息
      *
+     * @param dicType 词典类型。停用词词典(stop)或一般词典(custom)
      * @param location 配置路径
      * @return 返回new Tuple<路径, 默认词性>
      */
-    private Tuple<String, Nature> analysisDefaultInfo(String location) {
-        Nature defaultNature = Nature.n;
-        String path = location;
-        int cut = location.indexOf(' ');
-        if (cut > 0) {
-            // 有默认词性
-            String nature = location.substring(cut + 1);
-            path = location.substring(0, cut);
-            defaultNature = LexiconUtility.convertStringToNature(nature);
+    private Tuple<String, Nature> analyzePath(DicCategory dicType, String location) {
+        if(dicType.equals(DicCategory.STOP_WORD)){
+            return Tuple.tuple(location, null);
+        } else {
+            Nature defaultNature = Nature.n;
+            String path = location;
+            int cut = location.indexOf(' ');
+            if (cut > 0) {
+                // 有默认词性
+                String nature = location.substring(cut + 1);
+                path = location.substring(0, cut);
+                defaultNature = LexiconUtility.convertStringToNature(nature);
+            }
+            return Tuple.tuple(path, defaultNature);
         }
-        return Tuple.tuple(path, defaultNature);
     }
 
     /**
@@ -360,6 +483,9 @@ public class RemoteMonitor implements Runnable {
         return builder.toString();
     }
 
+    /**
+     * 词典拉取更新时词典的一行
+     */
     private class ParsedUpdateCmd {
         public static final String UPDATE_ACTION_SKIP = "skip";
         public static final String UPDATE_ACTION_ADD = "add";
@@ -408,4 +534,184 @@ public class RemoteMonitor implements Runnable {
                 '}';
         }
     }
+
+    /**
+     * 词典拉取更新的结果
+     */
+    private class DicFetchStatus {
+        /**
+         * 开始拉取的时间点
+         */
+        private Date fetchStart;
+
+        /**
+         * 结束拉取的时间点
+         */
+        private Date fetchEnd;
+
+        /**
+         * 拉取更新成功的词条数
+         */
+        private int successNum;
+
+        /**
+         * 拉取更新失败的词条数
+         */
+        private int failNum;
+
+        /**
+         * 拉取更新过程中发生的异常的其中一个异常示例
+         */
+        private Throwable exceptionSample;
+
+        /**
+         * 上一次拉取远程词典时，返回的词典最近修改时间点
+         */
+        private Date lastModifiedOfPreviousFetch;
+
+        /**
+         * 本次拉取远程词典时，返回的词典最近修改的时间点
+         */
+        private Date lastModified;
+
+        /**
+         * 本次拉取远程词典时，HTTP响应头的ETag值
+         */
+        private String ETag;
+
+        public void start(){
+            if(fetchStart != null) throw new IllegalStateException(
+                String.format("this fetch was already start at %s", fetchStart.toString())
+            );
+            fetchStart = new Date();
+        }
+
+        public void end(){
+            if(fetchEnd != null) throw new IllegalStateException(
+                String.format("this fetch was already end at %s", fetchEnd.toString())
+            );
+            fetchEnd = new Date();
+        }
+
+        public Date getFetchStart() {
+            return fetchStart;
+        }
+
+        public Date getFetchEnd() {
+            return fetchEnd;
+        }
+
+        public int getTotalNum() {
+            return successNum + failNum;
+        }
+
+        public int getSuccessNum() {
+            return successNum;
+        }
+
+        public int getFailNum() {
+            return failNum;
+        }
+
+        public Throwable getSampleException() {
+            return exceptionSample;
+        }
+
+        public void incrSuccessNum(){
+            successNum += 1;
+        }
+
+        public void incrFailNum(){
+            failNum += 1;
+        }
+
+        public void setSampleException(Throwable e){
+            exceptionSample = e;
+        }
+
+        public Date getLastModifiedOfPreviousFetch() {
+            return lastModifiedOfPreviousFetch;
+        }
+
+        public void setLastModifiedOfPreviousFetch(Date lastModifiedOfPreviousFetch) {
+            this.lastModifiedOfPreviousFetch = lastModifiedOfPreviousFetch;
+        }
+
+        public Date getLastModified() {
+            return lastModified;
+        }
+
+        public void setLastModified(Date lastModified) {
+            this.lastModified = lastModified;
+        }
+
+        public String getETag() {
+            return ETag;
+        }
+
+        public void setETag(String ETag) {
+            this.ETag = ETag;
+        }
+    }
+
+    /**
+     * 拉取的词典类型
+     */
+    public static class DicCategory{
+        /**
+         * 词典类型 - 主词典
+         */
+        public static final DicCategory MAIN = new DicCategory("custom", 0);
+
+        /**
+         * 词典类型 - 停用词典
+         */
+        public static final DicCategory STOP_WORD = new DicCategory("stop", 1);
+
+        private String type;
+
+        private int code;
+
+        public DicCategory(String type, int code) {
+            this.type = type;
+            this.code = code;
+        }
+
+        public String getType() {
+            return type;
+        }
+
+        public int getCode() {
+            return code;
+        }
+
+        public static DicCategory fromType(String type){
+            if(type.equals(MAIN.getType())) return MAIN;
+            else if(type.equals(STOP_WORD.getType())) return STOP_WORD;
+            else throw new IllegalArgumentException(String.format("未知type(%s)", type));
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            DicCategory that = (DicCategory) o;
+            return code == that.code &&
+                Objects.equals(type, that.type);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(type, code);
+        }
+
+        @Override
+        public String toString() {
+            return "DicCategory{" +
+                "type='" + type + '\'' +
+                ", code=" + code +
+                '}';
+        }
+    }
+
 }

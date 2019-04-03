@@ -8,4 +8,6 @@
 
     <!--用户可以在这里配置远程扩展停止词字典-->
     <!--<entry key="remote_ext_stopwords">stop_words_location</entry>-->
+    <!--上报拉取词典的任务结果到指定的某http地址-->
+    <entry key="remote_ext_report_fetch_status"></entry>
 </properties>

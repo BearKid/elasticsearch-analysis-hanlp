@@ -53,12 +53,19 @@ public class Dictionary {
                     singleton = new Dictionary(configuration);
                     pool.scheduleAtFixedRate(new ExtMonitor(), 10, 60, TimeUnit.SECONDS);
                     if (configuration.isEnableRemoteDict()) {
+                        final String reportFetchStatusURL = RemoteDictConfig.getSingleton().getReportFetchStatusURL();
                         for (String location : RemoteDictConfig.getSingleton().getRemoteExtDictionarys()) {
-                            pool.scheduleAtFixedRate(new RemoteMonitor(location, "custom"), 10, 60, TimeUnit.SECONDS);
+                            pool.scheduleAtFixedRate(
+                                new RemoteMonitor(location, RemoteMonitor.DicCategory.MAIN, reportFetchStatusURL),
+                                10, 60, TimeUnit.SECONDS
+                            );
                         }
 
                         for (String location : RemoteDictConfig.getSingleton().getRemoteExtStopWordDictionarys()) {
-                            pool.scheduleAtFixedRate(new RemoteMonitor(location, "stop"), 10, 60, TimeUnit.SECONDS);
+                            pool.scheduleAtFixedRate(
+                                new RemoteMonitor(location, RemoteMonitor.DicCategory.STOP_WORD, reportFetchStatusURL),
+                                10, 60, TimeUnit.SECONDS
+                            );
                         }
                     }
                     return singleton;

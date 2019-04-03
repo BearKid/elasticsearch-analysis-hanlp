@@ -6,9 +6,12 @@ grant {
   permission java.util.PropertyPermission "*", "read,write";
 
   // classloader
-  permission java.lang.RuntimePermission "setContextClassLoader";
-  permission java.lang.RuntimePermission "getClassLoader";
+  permission java.lang.RuntimePermission "*";
+
+  // need reflect permission, for example using gson to serialize/unserialize json
+  permission java.lang.reflect.ReflectPermission "*";
 
   // socket
   permission java.net.SocketPermission "*", "connect,resolve";
+
 };

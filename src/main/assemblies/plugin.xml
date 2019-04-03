@@ -31,44 +31,13 @@
         <dependencySet>
             <outputDirectory>/</outputDirectory>
             <useProjectArtifact>true</useProjectArtifact>
-            <useTransitiveFiltering>true</useTransitiveFiltering>
             <excludes>
-                <exclude>org.elasticsearch:elasticsearch</exclude>
-            </excludes>
-        </dependencySet>
-        <dependencySet>
-            <outputDirectory>/</outputDirectory>
-            <useProjectArtifact>true</useProjectArtifact>
-            <useTransitiveFiltering>true</useTransitiveFiltering>
-            <includes>
-                <include>com.hankcs:hanlp</include>
-            </includes>
-            <excludes>
-                <exclude>org.apache.lucene:lucene-core</exclude>
-                <exclude>org.apache.lucene:lucene-analyzers-common</exclude>
-                <exclude>org.apache.lucene:lucene-queryparser</exclude>
-                <exclude>org.apache.lucene:lucene-sandbox</exclude>
-            </excludes>
-        </dependencySet>
-        <dependencySet>
-            <outputDirectory>/</outputDirectory>
-            <useProjectArtifact>true</useProjectArtifact>
-            <useTransitiveFiltering>true</useTransitiveFiltering>
-            <includes>
-                <include>com.fasterxml.jackson.core:jackson-databind</include>
-                <include>com.fasterxml.jackson.core:jackson-annotations</include>
-            </includes>
-            <excludes>
+                <exclude>org.apache.lucene:lucene-*</exclude>
                 <exclude>com.fasterxml.jackson.core:jackson-core</exclude>
+                <exclude>org.apache.logging.log4j:log4j-core</exclude>
+                <exclude>org.apache.logging.log4j:log4j-api</exclude>
             </excludes>
         </dependencySet>
-        <dependencySet>
-            <outputDirectory>/</outputDirectory>
-            <useProjectArtifact>true</useProjectArtifact>
-            <useTransitiveFiltering>true</useTransitiveFiltering>
-            <includes>
-                <include>org.apache.httpcomponents:httpclient</include>
-            </includes>
-        </dependencySet>
+
     </dependencySets>
 </assembly>
