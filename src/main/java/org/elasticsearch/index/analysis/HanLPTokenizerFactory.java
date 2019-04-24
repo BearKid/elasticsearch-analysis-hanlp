@@ -80,7 +80,10 @@ public class HanLPTokenizerFactory extends AbstractTokenizerFactory {
                 return new HanLPTokenizer(AccessController.doPrivileged((PrivilegedAction<Segment>)HanLP::newSegment), configuration);
             case INDEX:
                 configuration.enableIndexMode(true);
-                return new HanLPTokenizer(AccessController.doPrivileged((PrivilegedAction<Segment>)HanLP::newSegment), configuration);
+                return new HanLPTokenizer(AccessController.doPrivileged(
+                    (PrivilegedAction<Segment>) () -> HanLP.newSegment().enableIndexMode(true)),
+                    configuration
+                );
             case NLP:
                 configuration.enableNameRecognize(true).enableTranslatedNameRecognize(true).enableJapaneseNameRecognize(true).enablePlaceRecognize(true).enableOrganizationRecognize(true).enablePartOfSpeechTagging(true);
                 return new HanLPTokenizer(AccessController.doPrivileged((PrivilegedAction<Segment>)HanLP::newSegment), configuration);
