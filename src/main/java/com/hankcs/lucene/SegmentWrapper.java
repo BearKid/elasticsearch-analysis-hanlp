@@ -77,9 +77,6 @@ public class SegmentWrapper {
         }
         String line = scanner.next();
         while (isBlank(line)) {
-            if (line == null) {
-                return null;
-            }
             offset += line.length() + 1;
             if (scanner.hasNext()) {
                 line = scanner.next();
@@ -103,12 +100,13 @@ public class SegmentWrapper {
             return null;
         }
         termArray = termList.toArray(new Term[0]);
-        for (Term term : termArray) {
-            term.offset += offset;
-        }
-        index = 0;
-        offset += line.length() + 1;
 
+        for (Term term: termArray) {
+            term.offset = term.offset + offset;
+            logger.info("base offset: {}, word: {}, length: {}, offset: {}, nature: {}", offset, term.word, term.length(), term.offset, term.nature);
+        }
+        offset += line.length();
+        index = 0;
         return termArray[index++];
     }
 
