@@ -103,7 +103,9 @@ public class SegmentWrapper {
 
         for (Term term: termArray) {
             term.offset = term.offset + offset;
-            logger.info("base offset: {}, word: {}, length: {}, offset: {}, nature: {}", offset, term.word, term.length(), term.offset, term.nature);
+            if(logger.isDebugEnabled()) {
+                logger.debug("base offset: {}, word: {}, length: {}, offset: {}, nature: {}", offset, term.word, term.length(), term.offset, term.nature);
+            }
         }
         offset += line.length();
         index = 0;
